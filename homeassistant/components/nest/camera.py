@@ -4,10 +4,12 @@ from abc import ABC
 import asyncio
 from collections.abc import Awaitable, Callable
 import datetime
+from dataclasses import dataclass
 import functools
 import logging
 from pathlib import Path
 from typing import override
+from urllib.parse import urlencode
 
 from google_nest_sdm.camera_traits import (
     CameraLiveStreamTrait,
@@ -29,10 +31,12 @@ from homeassistant.components.camera import (
 from homeassistant.components.stream import CONF_EXTRA_PART_WAIT_TIME
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import config_entry_oauth2_flow
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_track_point_in_utc_time
 from homeassistant.util.dt import utcnow
 
+from .const import CONF_PROJECT_ID
 from .device_info import NestDeviceInfo
 from .types import NestConfigEntry
 
@@ -49,6 +53,23 @@ MAX_REFRESH_BACKOFF_INTERVAL = datetime.timedelta(minutes=10)
 BACKOFF_MULTIPLIER = 1.5
 
 
+@dataclass(frozen=True)
+class Go2rtcNestCredentials:
+    """SDM credentials for go2rtc's native `nest:` source.
+
+    WebRTC-only Nest cameras have no server-side frame in Home Assistant, so
+    camera.snapshot returns a placeholder. go2rtc (bundled with HA) can ingest
+    these cameras via its `nest:` source and capture a still. These are the
+    fields that source needs; they are the same credentials the integration
+    already uses to talk to the SDM API.
+    """
+
+    client_id: str
+    client_secret: str
+    refresh_token: str
+    project_id: str
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: NestConfigEntry,
@@ -56,13 +77,25 @@ async def async_setup_entry(
 ) -> None:
     """Set up the cameras."""
 
+    implementation = (
+        await config_entry_oauth2_flow.async_get_config_entry_implementation(
+            hass, entry
+        )
+    )
+    go2rtc_credentials = Go2rtcNestCredentials(
+        client_id=implementation.client_id,
+        client_secret=implementation.client_secret,
+        refresh_token=entry.data["token"]["refresh_token"],
+        project_id=entry.data[CONF_PROJECT_ID],
+    )
+
     def devices_added(devices: list[Device]) -> None:
         entities: list[NestCameraBaseEntity] = []
         for device in devices:
             if (live_stream := device.traits.get(CameraLiveStreamTrait.NAME)) is None:
                 continue
             if StreamingProtocol.WEB_RTC in live_stream.supported_protocols:
-                entities.append(NestWebRTCEntity(device))
+                entities.append(NestWebRTCEntity(device, go2rtc_credentials))
             elif StreamingProtocol.RTSP in live_stream.supported_protocols:
                 entities.append(NestRTSPEntity(device))
 
@@ -251,15 +284,47 @@ class NestRTSPEntity(NestCameraBaseEntity):
 class NestWebRTCEntity(NestCameraBaseEntity):
     """Nest cameras that use WebRTC."""
 
-    def __init__(self, device: Device) -> None:
+    def __init__(
+        self, device: Device, go2rtc_credentials: Go2rtcNestCredentials
+    ) -> None:
         """Initialize the camera."""
         super().__init__(device)
         self._webrtc_sessions: dict[str, WebRtcStream] = {}
         self._refresh_unsub: dict[str, Callable[[], None]] = {}
-        # The bundled placeholder is a PNG; the camera platform would otherwise
-        # serve it as its default image/jpeg, corrupting the frame for any
-        # client that trusts the Content-Type header.
-        self.content_type = "image/png"
+        self._go2rtc_credentials = go2rtc_credentials
+
+    @property
+    @override
+    def use_stream_for_stills(self) -> bool:
+        """Capture snapshots from the go2rtc-managed stream.
+
+        Routes camera.snapshot through the stream/WebRTCProvider path instead
+        of returning the placeholder, so go2rtc can supply a real frame.
+        """
+        return True
+
+    @override
+    async def stream_source(self) -> str | None:
+        """Return a go2rtc `nest:` source for server-side frame capture.
+
+        Home Assistant relays WebRTC signalling to Google but never terminates
+        the media, so there is no frame to snapshot. Exposing a `nest:` source
+        lets the bundled go2rtc integration ingest the camera and serve stills
+        via the existing camera WebRTCProvider.async_get_image path.
+        """
+        creds = self._go2rtc_credentials
+        params = {
+            "client_id": creds.client_id,
+            "client_secret": creds.client_secret,
+            "refresh_token": creds.refresh_token,
+            "project_id": creds.project_id,
+            # The SDM device id is the last segment of the device resource name.
+            "device_id": self._device.name.rsplit("/", 1)[-1],
+            "protocols": "WEB_RTC",
+            "video": "h264",
+            "audio": "opus",
+        }
+        return f"nest:?{urlencode(params)}"
 
     async def _async_refresh_stream(self, session_id: str) -> datetime.datetime | None:
         """Refresh stream to extend expiration time."""
